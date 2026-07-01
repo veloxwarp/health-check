@@ -53,7 +53,7 @@ communication platform like Discord or Microsoft teams.
 ``` dockerfile
 FROM alpine:3.20.1
 
-ADD --chmod=755 https://github.com/fpco/health-check/releases/download/v0.4.0/health-check-x86_64-unknown-linux-musl /usr/bin/health-check
+ADD --chmod=755 https://github.com/veloxwarp/health-check/releases/download/v0.4.0/health-check-x86_64-unknown-linux-musl /usr/bin/health-check
 
 ENTRYPOINT [ "/usr/bin/health-check" ]
 
