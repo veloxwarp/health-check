@@ -158,7 +158,7 @@ impl Cli {
             )
         });
 
-        std::thread::spawn(|| watch_child(send, child));
+        let child_watcher = std::thread::spawn(|| watch_child(send, child));
 
         let msg = recv.recv();
         // Drop the recv immediately, just a minor optimization to avoid
@@ -168,11 +168,19 @@ impl Cli {
             Ok(msg) => match msg {
                 MainMessage::Error(e) => Err(e),
                 MainMessage::DeadlockDetected => {
-                    kill_child_process_group(
+                    match kill_child_process_group(
                         nix::unistd::Pid::from_raw(child_pid),
                         Signal::SIGKILL,
-                    )
-                    .context("Unable to kill timed-out child process group")?;
+                    ) {
+                        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                        Err(error) => {
+                            return Err(error)
+                                .context("Unable to kill timed-out child process group");
+                        }
+                    }
+                    child_watcher
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Child watcher thread panicked"))?;
                     Err(anyhow::anyhow!(
                         "Potential deadlock detected, too long without output from child process"
                     ))
@@ -366,4 +374,58 @@ fn handle_signals(
 
 fn kill_child_process_group(child_pid: nix::unistd::Pid, signal: Signal) -> nix::Result<()> {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(-child_pid.as_raw()), signal)
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::{SendMainMessage, kill_child_process_group, watch_child};
+    use nix::{sys::signal::Signal, unistd::Pid};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn killing_process_group_terminates_and_reaps_process_tree() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 300 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let direct_pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+        let mut grandchild_line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut grandchild_line)
+            .unwrap();
+        let grandchild_pid = Pid::from_raw(grandchild_line.trim().parse().unwrap());
+
+        let (send, recv) = mpsc::channel();
+        let watcher = thread::spawn(move || watch_child(SendMainMessage(send), child));
+        kill_child_process_group(direct_pid, Signal::SIGKILL).unwrap();
+        watcher.join().unwrap();
+        let status = match recv.recv_timeout(Duration::from_secs(2)).unwrap() {
+            super::MainMessage::ChildExited(status) => status,
+            message => panic!("unexpected watcher message: {message:?}"),
+        };
+        assert!(!status.success());
+        assert_eq!(
+            nix::sys::signal::kill(direct_pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while nix::sys::signal::kill(grandchild_pid, None).is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            nix::sys::signal::kill(grandchild_pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "grandchild was not reaped by the host init process"
+        );
+    }
 }
