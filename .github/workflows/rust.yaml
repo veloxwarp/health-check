@@ -45,6 +45,8 @@ jobs:
         if: runner.os == 'Linux'
       - name: Build application
         run: just cargo-build
+      - name: Run tests
+        run: cargo test --workspace --locked
       - name: Lint
         run: |
           just cargo-clippy-check

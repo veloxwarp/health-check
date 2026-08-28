@@ -5,6 +5,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
+    os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
     sync::{
@@ -88,6 +89,9 @@ impl Cli {
         command.args(&self.args[..]);
 
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Put the monitored application and its descendants in their own
+        // process group so signals and timeout cleanup reach the whole tree.
+        command.process_group(0);
 
         let mut child = command
             .spawn()
@@ -163,9 +167,16 @@ impl Cli {
         let res = match msg {
             Ok(msg) => match msg {
                 MainMessage::Error(e) => Err(e),
-                MainMessage::DeadlockDetected => Err(anyhow::anyhow!(
-                    "Potential deadlock detected, too long without output from child process"
-                )),
+                MainMessage::DeadlockDetected => {
+                    kill_child_process_group(
+                        nix::unistd::Pid::from_raw(child_pid),
+                        Signal::SIGKILL,
+                    )
+                    .context("Unable to kill timed-out child process group")?;
+                    Err(anyhow::anyhow!(
+                        "Potential deadlock detected, too long without output from child process"
+                    ))
+                }
                 MainMessage::ChildExited(exit_status) => {
                     // Memory ordering comment: We use relaxed since
                     // there is only one atomic variable and we are
@@ -340,7 +351,7 @@ fn handle_signals(
                 // order is guaranteed in the individual atomic
                 // variable.
                 child_was_killed.store(true, Ordering::Relaxed);
-                if let Err(e) = nix::sys::signal::kill(child_pid, signal)
+                if let Err(e) = kill_child_process_group(child_pid, signal)
                     .context("Unable to send signal to child process")
                 {
                     send.send(MainMessage::Error(e));
@@ -351,4 +362,8 @@ fn handle_signals(
             }
         };
     }
+}
+
+fn kill_child_process_group(child_pid: nix::unistd::Pid, signal: Signal) -> nix::Result<()> {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(-child_pid.as_raw()), signal)
 }
