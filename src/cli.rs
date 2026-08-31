@@ -5,6 +5,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
+    os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
     sync::{
@@ -88,6 +89,9 @@ impl Cli {
         command.args(&self.args[..]);
 
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Put the monitored application and its descendants in their own
+        // process group so signals and timeout cleanup reach the whole tree.
+        command.process_group(0);
 
         let mut child = command
             .spawn()
@@ -154,7 +158,7 @@ impl Cli {
             )
         });
 
-        std::thread::spawn(|| watch_child(send, child));
+        let child_watcher = std::thread::spawn(|| watch_child(send, child));
 
         let msg = recv.recv();
         // Drop the recv immediately, just a minor optimization to avoid
@@ -163,9 +167,24 @@ impl Cli {
         let res = match msg {
             Ok(msg) => match msg {
                 MainMessage::Error(e) => Err(e),
-                MainMessage::DeadlockDetected => Err(anyhow::anyhow!(
-                    "Potential deadlock detected, too long without output from child process"
-                )),
+                MainMessage::DeadlockDetected => {
+                    match kill_child_process_group(
+                        nix::unistd::Pid::from_raw(child_pid),
+                        Signal::SIGKILL,
+                    ) {
+                        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                        Err(error) => {
+                            return Err(error)
+                                .context("Unable to kill timed-out child process group");
+                        }
+                    }
+                    child_watcher
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Child watcher thread panicked"))?;
+                    Err(anyhow::anyhow!(
+                        "Potential deadlock detected, too long without output from child process"
+                    ))
+                }
                 MainMessage::ChildExited(exit_status) => {
                     // Memory ordering comment: We use relaxed since
                     // there is only one atomic variable and we are
@@ -340,7 +359,7 @@ fn handle_signals(
                 // order is guaranteed in the individual atomic
                 // variable.
                 child_was_killed.store(true, Ordering::Relaxed);
-                if let Err(e) = nix::sys::signal::kill(child_pid, signal)
+                if let Err(e) = kill_child_process_group(child_pid, signal)
                     .context("Unable to send signal to child process")
                 {
                     send.send(MainMessage::Error(e));
@@ -350,5 +369,63 @@ fn handle_signals(
                 send.send(MainMessage::Error(e));
             }
         };
+    }
+}
+
+fn kill_child_process_group(child_pid: nix::unistd::Pid, signal: Signal) -> nix::Result<()> {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(-child_pid.as_raw()), signal)
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::{SendMainMessage, kill_child_process_group, watch_child};
+    use nix::{sys::signal::Signal, unistd::Pid};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn killing_process_group_terminates_and_reaps_process_tree() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 300 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let direct_pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+        let mut grandchild_line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut grandchild_line)
+            .unwrap();
+        let grandchild_pid = Pid::from_raw(grandchild_line.trim().parse().unwrap());
+
+        let (send, recv) = mpsc::channel();
+        let watcher = thread::spawn(move || watch_child(SendMainMessage(send), child));
+        kill_child_process_group(direct_pid, Signal::SIGKILL).unwrap();
+        watcher.join().unwrap();
+        let status = match recv.recv_timeout(Duration::from_secs(2)).unwrap() {
+            super::MainMessage::ChildExited(status) => status,
+            message => panic!("unexpected watcher message: {message:?}"),
+        };
+        assert!(!status.success());
+        assert_eq!(
+            nix::sys::signal::kill(direct_pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while nix::sys::signal::kill(grandchild_pid, None).is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            nix::sys::signal::kill(grandchild_pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "grandchild was not reaped by the host init process"
+        );
     }
 }

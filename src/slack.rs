@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use reqwest::Url;
+use std::time::Duration;
 
 pub(crate) struct SlackApp {
     webhook: Url,
@@ -82,7 +83,7 @@ impl SlackApp {
                 {
                     "mrkdwn_in": ["text"],
                     "author_name": "Logs",
-                    "text": latest_output
+                    "text": truncate_for_slack(latest_output)
                 }
             ]
         });
@@ -107,7 +108,9 @@ impl SlackApp {
                 ),
             );
         }
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
         let response = client.post(self.webhook.clone()).json(&value).send()?;
         if response.status().is_success() {
             Ok(())
@@ -120,9 +123,20 @@ impl SlackApp {
     }
 }
 
+fn truncate_for_slack(output: &str) -> String {
+    const MAX_CHARS: usize = 2_800;
+    let mut chars = output.chars();
+    let truncated: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}\n… output truncated")
+    } else {
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::slack::readable_image_id;
+    use crate::slack::{readable_image_id, truncate_for_slack};
 
     #[test]
     fn guess_readable_image_id_works() {
@@ -132,5 +146,13 @@ mod tests {
 
         let image_id = readable_image_id("d5def5afc6030dda860a79f231b295e2e412bc28");
         assert_eq!(image_id, "d5def5afc6030dda860a79f231b295e2e412bc28");
+    }
+
+    #[test]
+    fn slack_output_is_bounded_on_character_boundaries() {
+        let output = "🦀".repeat(3_000);
+        let truncated = truncate_for_slack(&output);
+        assert!(truncated.ends_with("… output truncated"));
+        assert!(truncated.chars().count() < 3_000);
     }
 }
