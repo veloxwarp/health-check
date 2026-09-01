@@ -17,7 +17,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use clap::{Parser, arg};
+use clap::Parser;
 
 use crate::{line_helper::LineHelper, slack::SlackApp};
 
